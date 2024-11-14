@@ -5,7 +5,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"github.com/jpillora/backoff"
 	"io/ioutil"
 	"log"
 	"net"
@@ -19,7 +18,9 @@ import (
 	"sync"
 	"syscall"
 	"time"
-        "github.com/patrickmn/go-cache"
+
+	"github.com/jpillora/backoff"
+	"github.com/patrickmn/go-cache"
 )
 
 const VERSION string = "0.0.9"
@@ -194,18 +195,18 @@ func genTags(metric, metricTags string) string {
 // sendPacket takes a []byte and writes that directly to a UDP socket
 // that was assigned for target.
 func sendPacket(buff []byte, target string, sendproto string, TCPtimeout time.Duration, boff *backoff.Backoff) {
-       switch sendproto {
-        case "UDP":
+	switch sendproto {
+	case "UDP":
 		conn, err := net.ListenUDP("udp", nil)
 		if err != nil {
 			log.Panicln(err)
 		}
 		conn.WriteToUDP(buff, udpAddr[target])
 		conn.Close()
-        case "TCP":
-                if verbose {
-                   log.Printf("Sending to target: %s", target)
-                }
+	case "TCP":
+		if verbose {
+			log.Printf("Sending to target: %s", target)
+		}
 		for i := 0; i < TCPMaxRetries; i++ {
 			conn, err := net.DialTimeout("tcp", target, TCPtimeout)
 			if err != nil {
@@ -292,62 +293,76 @@ func handleBuff(buff []byte) {
 
 		if err == nil {
 
-                        target := hashRing.GetNode(metric).Server
-                        ctarget := target
-
-                        // resolve and cache
-                        if dnscache {
-                                gettarget, found := c.Get(target)
-				if found {
-				   ctarget = gettarget.(string)
-				   if verbose {
-				      log.Printf("Found in cache target %s (%s)", target, ctarget)
-				   }
-				} else {
-                                   targetaddr, err := net.ResolveUDPAddr("udp", target)
-                                   if verbose {
-                                      log.Printf("Not found in cache adding target %s (%s)", target, ctarget)
-                                   }
-			           if err != nil {
-					   log.Printf("Error resolving target %s", target)
-				   }
-				   c.Set(target, targetaddr.String(), dnscacheExp)
-				   ctarget = targetaddr.String()
+			var targets []string
+			if sendToAllSinks {
+				for _, v := range hashRing.GetRing() {
+					targets = append(targets, v.Server)
 				}
-                        }
-			// check built packet size and send if metric doesn't fit
-			if packets[target].Len()+size > packetLen {
-				sendPacket(packets[target].Bytes(), ctarget, sendproto, TCPtimeout, boff)
-				packets[target].Reset()
-			}
-			// add to packet
-			if len(metricsPrefix) != 0 || len(metricTags) != 0 {
-				buffPrefix, err := extendMetric(buff[offset:offset+size], metricsPrefix, metricTags)
 				if verbose {
-					log.Printf("Sending %s to %s (%s)", buffPrefix, target, ctarget)
+					log.Printf("sending packets to all sinks: (%v)", targets)
 				}
-				if err != nil {
-					if len(metricsPrefix) != 0 {
-						log.Printf("Error %s when adding prefix %s", err, metricsPrefix)
-						break
-					}
-					if len(metricTags) != 0 {
-						log.Printf("Error %s when adding tag %s", err, metricTags)
-						break
-					}
-				}
-				packets[target].Write(buffPrefix)
 			} else {
-				if verbose {
-					log.Printf("Sending %s to %s (%s)", metric, target, ctarget)
-				}
-				packets[target].Write(buff[offset : offset+size])
+				targets = []string{hashRing.GetNode(metric).Server}
 			}
-			packets[target].Write(sep)
-			numMetrics++
-		}
 
-		offset = offset + size + 1
+			for _, target := range targets {
+
+				ctarget := target
+
+				// resolve and cache
+				if dnscache {
+					gettarget, found := c.Get(target)
+					if found {
+						ctarget = gettarget.(string)
+						if verbose {
+							log.Printf("Found in cache target %s (%s)", target, ctarget)
+						}
+					} else {
+						targetaddr, err := net.ResolveUDPAddr("udp", target)
+						if verbose {
+							log.Printf("Not found in cache adding target %s (%s)", target, ctarget)
+						}
+						if err != nil {
+							log.Printf("Error resolving target %s", target)
+						}
+						c.Set(target, targetaddr.String(), dnscacheExp)
+						ctarget = targetaddr.String()
+					}
+				}
+				// check built packet size and send if metric doesn't fit
+				if packets[target].Len()+size > packetLen {
+					sendPacket(packets[target].Bytes(), ctarget, sendproto, TCPtimeout, boff)
+					packets[target].Reset()
+				}
+				// add to packet
+				if len(metricsPrefix) != 0 || len(metricTags) != 0 {
+					buffPrefix, err := extendMetric(buff[offset:offset+size], metricsPrefix, metricTags)
+					if verbose {
+						log.Printf("Sending %s to %s (%s)", buffPrefix, target, ctarget)
+					}
+					if err != nil {
+						if len(metricsPrefix) != 0 {
+							log.Printf("Error %s when adding prefix %s", err, metricsPrefix)
+							break
+						}
+						if len(metricTags) != 0 {
+							log.Printf("Error %s when adding tag %s", err, metricTags)
+							break
+						}
+					}
+					packets[target].Write(buffPrefix)
+				} else {
+					if verbose {
+						log.Printf("Sending %s to %s (%s)", metric, target, ctarget)
+					}
+					packets[target].Write(buff[offset : offset+size])
+				}
+				packets[target].Write(sep)
+				numMetrics++
+			}
+
+			offset = offset + size + 1
+		}
 	}
 
 	if numMetrics == 0 {
@@ -490,6 +505,8 @@ func runServer(host string, port int) {
 	}
 }
 
+var sendToAllSinks bool
+
 func main() {
 	var bindAddress string
 	var port int
@@ -501,6 +518,7 @@ func main() {
 	flag.StringVar(&bindAddress, "b", "0.0.0.0", "IP Address to listen on")
 
 	flag.StringVar(&prefix, "prefix", "statsrelay", "The prefix to use with self generated stats")
+	flag.BoolVar(&sendToAllSinks, "send-to-all-sinks", false, "Send each metric to all sinks")
 	flag.StringVar(&metricsPrefix, "metrics-prefix", "", "The prefix to use with metrics passed through statsrelay")
 
 	flag.StringVar(&metricTags, "metrics-tags", "", "Comma separated tags for each relayed metric. Example: foo:bar,test,test2:bar")
@@ -510,10 +528,10 @@ func main() {
 	flag.BoolVar(&verbose, "verbose", false, "Verbose output")
 	flag.BoolVar(&verbose, "v", false, "Verbose output")
 
-        flag.BoolVar(&dnscache, "dnscache", false, "Enable in app DNS cache for resolved TCP sendout sharded endpoints")
-        flag.DurationVar(&dnscacheTime, "dnscache-time", 1*time.Second, "Time we cache resolved adresses of sharded endpoint")
-        flag.DurationVar(&dnscachePurge, "dnscache-purge", 5*time.Second, "When we purge stale elements in cache")
-        flag.DurationVar(&dnscacheExp, "dnscache-expiration", 1*time.Second, "When set new object after resolv then use this expiration time in cache")
+	flag.BoolVar(&dnscache, "dnscache", false, "Enable in app DNS cache for resolved TCP sendout sharded endpoints")
+	flag.DurationVar(&dnscacheTime, "dnscache-time", 1*time.Second, "Time we cache resolved adresses of sharded endpoint")
+	flag.DurationVar(&dnscachePurge, "dnscache-purge", 5*time.Second, "When we purge stale elements in cache")
+	flag.DurationVar(&dnscacheExp, "dnscache-expiration", 1*time.Second, "When set new object after resolv then use this expiration time in cache")
 
 	flag.StringVar(&sendproto, "sendproto", "UDP", "IP Protocol for sending data: TCP, UDP, or TEST")
 	flag.IntVar(&packetLen, "packetlen", 1400, "Max packet length. Must be lower than MTU plus IPv4 and UDP headers to avoid fragmentation.")
@@ -528,7 +546,6 @@ func main() {
 	flag.DurationVar(&TCPMinBackoff, "backoff-min", 50*time.Millisecond, "Backoff minimal (integer) time in Millisecond")
 	flag.DurationVar(&TCPMaxBackoff, "backoff-max", 1000*time.Millisecond, "Backoff maximal (integer) time in Millisecond")
 	flag.Float64Var(&TCPFactorBackoff, "backoff-factor", 1.5, "Backoff factor (float)")
-
 
 	defaultBufferSize, err := getSockBufferMaxSize()
 	if err != nil {

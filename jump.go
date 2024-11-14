@@ -125,6 +125,10 @@ func (chr *JumpHashRing) GetNode(key string) Node {
 
 // GetNodes returns a slice of Node objects one for each replica where the
 // object is stored.
+func (chr *JumpHashRing) GetRing() []Node {
+	return chr.ring
+}
+
 func (chr *JumpHashRing) GetNodes(key string) []Node {
 	ring := make([]Node, 0)
 	ret := make([]Node, 0)
